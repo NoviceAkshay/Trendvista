@@ -209,6 +209,10 @@ def root():
 def health_check():
     return {"status": "ok"}
 
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
 # =========================================================
 # Auth with Supabase users table
 # =========================================================
