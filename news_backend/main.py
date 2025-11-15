@@ -45,6 +45,9 @@ from news_backend.supabase_client import (
     fetch_articles_batch,
     update_article_keywords
 )
+
+from news_backend.lazy_models import ensure_nltk, get_sentiment, get_ner, get_kw
+
 from news_backend.database import Base, engine, get_db
 from news_backend.models import User, PasswordResetToken
 from news_backend.admin_routes import router as admin_router
@@ -151,6 +154,7 @@ def articles_count():
     r = supabase.table("articles").select("*", count="exact", head=True).execute()
     return r.count
 
+
 # =========================================================
 # Google OAuth (optional)
 # =========================================================
@@ -166,9 +170,9 @@ oauth.register(
 # =========================================================
 # NLP Pipelines (load once)
 # =========================================================
-sentiment_analyzer = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
-# ✅ Register all routers
+# sentiment_analyzer = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+# ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+# # ✅ Register all routers
 app.include_router(topic_routes.router)
 
 # =========================================================
@@ -188,6 +192,16 @@ class Article(BaseModel):
     topic_id: str | None = None
     title: str = ""
     description: str = ""
+
+
+
+
+
+
+
+
+
+
 
 # =========================================================
 # Routers from other modules (that don’t depend on SQLite)
@@ -728,40 +742,69 @@ def preprocess_text_endpoint(query: str = Query(..., description="Text to prepro
     processed = preprocess_query(query)
     return {"original": query, "processed": processed}
 
+# from fastapi import Query
+
 @app.get("/sentiment")
-def sentiment_endpoint(text: str = Query(..., description="Text for sentiment analysis")):
+def sentiment_endpoint(
+    text: str = Query(..., description="Text for sentiment analysis")
+):
+    # Preprocess (keep your existing logic)
     cleaned_text = preprocess_query(text)
-    result = sentiment_analyzer(cleaned_text)
-    if not result:
-        return {"sentiment": {"label": "UNKNOWN", "confidence": 0.0}}
 
-    all_scores = {}
-    result_scores = sentiment_analyzer(cleaned_text, return_all_scores=True)
-    if isinstance(result_scores, list) and len(result_scores) > 0:
-        all_scores = {x['label']: float(x['score']) for x in result_scores[0]}
-    else:
-        all_scores = {result[0]['label']: float(result[0]['score'])}
+    # Ensure tokenizers lazily; prevents blocking startup
+    ensure_nltk()
 
-    res = result[0]
-    return {
-        "sentiment": {
-            "label": res["label"].capitalize(),
-            "confidence": round(res["score"], 4),
-            "all_scores": all_scores
+    analyzer = get_sentiment()
+    try:
+        result = analyzer(cleaned_text)  # [{'label': 'POSITIVE', 'score': 0.999...}]
+        if not result:
+            return {"sentiment": {"label": "UNKNOWN", "confidence": 0.0, "all_scores": {}}}
+
+        # Optionally get all scores for both classes
+        try:
+            all_scores_list = analyzer(cleaned_text, return_all_scores=True)
+            if isinstance(all_scores_list, list) and len(all_scores_list) > 0:
+                all_scores = {x["label"]: float(x["score"]) for x in all_scores_list[0]}
+            else:
+                all_scores = {result[0]["label"]: float(result[0]["score"])}
+        except Exception:
+            # Some pipelines/models may not support return_all_scores
+            all_scores = {result[0]["label"]: float(result[0]["score"])}
+
+        res = result[0]
+        return {
+            "sentiment": {
+                "label": str(res["label"]).capitalize(),
+                "confidence": round(float(res["score"]), 4),
+                "all_scores": all_scores,
+            }
         }
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sentiment analysis failed: {e}")
+
 
 @app.get("/ner")
-def named_entity_recognition(text: str = Query(..., description="Text for entity extraction")):
-    entities = ner_pipeline(text)
-    ner_results = [{
-        "word": ent["word"],
-        "label": ent["entity_group"],
-        "score": float(ent["score"]),
-        "start": ent["start"],
-        "end": ent["end"]
-    } for ent in entities]
-    return {"entities": ner_results}
+def named_entity_recognition(
+    text: str = Query(..., description="Text for entity extraction")
+):
+    ner = get_ner()
+    try:
+        entities = ner(text)  # aggregated entities
+        ner_results = []
+        for ent in entities or []:
+            ner_results.append(
+                {
+                    "word": ent.get("word"),
+                    "label": ent.get("entity_group") or ent.get("entity"),
+                    "score": float(ent.get("score", 0.0)),
+                    "start": int(ent.get("start", 0)),
+                    "end": int(ent.get("end", 0)),
+                }
+            )
+        return {"entities": ner_results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"NER failed: {e}")
+
 
 # =========================================================
 # Startup: list routes
@@ -846,52 +889,86 @@ def news_count():
 from fastapi import Query
 from keybert import KeyBERT
 
-kw_model = KeyBERT()  # load once at startup
+# kw_model = KeyBERT()  # load once at startup
 
 @app.get("/extract-keywords")
-def extract_keywords(text: str = Query(..., min_length=3), top_n: int = 5):
-    kws = kw_model.extract_keywords(
-        text,
-        keyphrase_ngram_range=(1, 2),
-        stop_words="english",
-        top_n=top_n,
-    )
-    return {"keywords": [{"word": w, "score": float(s)} for (w, s) in kws]}
+def extract_keywords(
+    text: str = Query(..., min_length=3),
+    top_n: int = Query(5, ge=1, le=50),
+):
+    kw = get_kw()
+    try:
+        kws = kw.extract_keywords(
+            text,
+            keyphrase_ngram_range=(1, 2),
+            stop_words="english",
+            top_n=top_n,
+        )  # List[Tuple[str, float]]
+        return {"keywords": [{"word": w, "score": float(s)} for (w, s) in (kws or [])]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Keyword extraction failed: {e}")
 
 
 
 
-# main.py (or a service module)
-from news_backend.supabase_client import fetch_articles_batch, update_article_keywords
+
+from fastapi import Query
+
+# If not already imported at the top of main.py:
+# from .lazy_models import get_kw
 
 @app.post("/extract-keywords/batch")
-def extract_keywords_batch(page_size: int = 500, top_n: int = 5):
+def extract_keywords_batch(
+    page_size: int = Query(500, ge=1, le=2000),
+    top_n: int = Query(5, ge=1, le=50),
+):
     processed = 0
     offset = 0
     results = []
+    kw = get_kw()  # lazily create KeyBERT once for the whole batch
+
     while True:
         batch = fetch_articles_batch(offset, page_size)
         if not batch:
             break
+
         updates = []
         for a in batch:
-            text = " ".join(filter(None, [a.get("title",""), a.get("description",""), a.get("content","")])).strip()
+            text = " ".join(
+                filter(None, [a.get("title", ""), a.get("description", ""), a.get("content", "")])
+            ).strip()
             if not text:
                 continue
-            kws = kw_model.extract_keywords(
-                text,
-                keyphrase_ngram_range=(1, 2),
-                stop_words="english",
-                top_n=top_n,
+
+            try:
+                kws = kw.extract_keywords(
+                    text,
+                    keyphrase_ngram_range=(1, 2),
+                    stop_words="english",
+                    top_n=top_n,
+                )  # List[Tuple[str, float]]
+            except Exception as e:
+                # Skip this record but continue the batch
+                results.append(
+                    {"id": a.get("id"), "error": f"keyword extraction failed: {e}"}
+                )
+                continue
+
+            updates.append({"id": a["id"], "keywords": [w for (w, _) in (kws or [])]})
+            results.append(
+                {"id": a["id"], "keywords": [{"word": w, "score": float(s)} for (w, s) in (kws or [])]}
             )
-            updates.append({"id": a["id"], "keywords": [w for (w, _) in kws]})
-            results.append({"id": a["id"], "keywords": [{"word": w, "score": float(s)} for (w, s) in kws]})
-        update_article_keywords(updates)
-        processed += len(updates)
+
+        if updates:
+            update_article_keywords(updates)
+            processed += len(updates)
+
         if len(batch) < page_size:
             break
         offset += page_size
+
     return {"updated": processed, "items": results}
+
 
 from datetime import datetime, timedelta
 from collections import Counter
@@ -1116,7 +1193,6 @@ def detect_trends_topics(time_range: str = Query("7d", alias="range")):
 from news_backend.admin_routes import router as admin_router
 app.include_router(admin_router)
 from news_backend.auth import router as auth_router
-app.include_router(auth_router)
 #...............................
 import requests
 NEWS_API_KEY="fd6b4247f1054b2e8b2f3c1eed92ee45"
